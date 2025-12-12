@@ -2,20 +2,21 @@
 set -euo pipefail
 
 if [[ $# -lt 4 ]]; then
-  echo "Usage: $0 systemrescue.iso image_folder output.iso"
+  echo "Usage: $0 systemrescue.iso image_folder disk_name output.iso"
+  echo "Example: $0 systemrescue.iso /path/to/img nvme0n1 out.iso"
   exit 1
 fi
 
 SYSR="$1"
 IMGDIR="$2"
-DSK="$3"
+DSK="$3"      # e.g. nvme0n1, sda, mmcblk0
 OUTISO="$4"
 
-if [[ ! -f "$SYSR" ]]; then echo "ERROR: ISO not found"; exit 1; fi
-if [[ ! -d "$IMGDIR" ]]; then echo "ERROR: Image folder not found"; exit 1; fi
+if [[ ! -f "$SYSR" ]]; then echo "ERROR: ISO not found: $SYSR"; exit 1; fi
+if [[ ! -d "$IMGDIR" ]]; then echo "ERROR: Image folder not found: $IMGDIR"; exit 1; fi
 
 command -v xorriso >/dev/null || { echo "Install xorriso"; exit 1; }
-command -v 7z >/dev/null || { echo "Install p7zip"; exit 1; }
+command -v 7z >/dev/null || { echo "Install p7zip (7z)"; exit 1; }
 
 WORKDIR="$(mktemp -d)"
 ISOEX="$WORKDIR/iso"
@@ -34,51 +35,74 @@ mkdir -p "$ISOEX/autorun"
 cat > "$ISOEX/autorun/restore" << EOF
 #!/usr/bin/env bash
 
-# DEBUG MODE: no set -e, keep shell alive
+# DEBUG-FRIENDLY: no set -e
 echo "============================"
-echo " DEBUG RESTORE START"
+echo " DEAD-BOOT-SUICIDE RESTORE "
 echo "============================"
 
 IMG="/run/archiso/bootmnt/custom-img/$IMGBASE"
-DISK="$DSK"
+DISK="/dev/$DSK"
 
-echo " Image dir: \$IMG"
-echo " Target disk: \$DISK"
+echo " Image dir : \$IMG"
+echo " Target disk (initial): \$DISK"
 echo
-
-if [[ -z "\$DSK" ]]; then
-    echo " ERROR: DSK not detected from CPU model."
-    echo " Dropping into shell."
-    bash
-fi
 
 if [[ ! -d "\$IMG" ]]; then
     echo " ERROR: Image directory missing: \$IMG"
-    echo " Dropping into shell."
     bash
+fi
+
+# If target disk doesn't exist, prompt user
+if [[ ! -b "\$DISK" ]]; then
+    echo " WARNING: Target disk \$DISK does not exist."
+    echo
+    echo " Available devices:"
+    ls -1 /dev/sd* /dev/nvme* /dev/mmcblk* 2>/dev/null || ls -1 /dev/*
+    echo
+    read -r -p " Enter FULL target disk path (e.g. /dev/nvme0n1): " DISK
+    echo " Using DISK=\$DISK"
+    if [[ ! -b "\$DISK" ]]; then
+        echo " ERROR: \$DISK is not a block device."
+        bash
+    fi
 fi
 
 cd "\$IMG"
 
-# Partition table restore
+DISKBASE="\$(basename "\$DISK")"
+
+# -----------------------------------
+# RESTORE PARTITION TABLE
+# -----------------------------------
 if [[ -f d1.partitions ]]; then
-    echo " Restoring partition table..."
+    echo " Restoring partition table using d1.partitions..."
     sfdisk "\$DISK" < d1.partitions 2>&1 | tee /tmp/restore.log
-    partprobe "\$DISK" 2>&1 | tee -a /tmp/restore.log
+elif [[ -f "\${DISKBASE}-pt.sf" ]]; then
+    echo " Restoring partition table using \${DISKBASE}-pt.sf..."
+    sfdisk "\$DISK" < "\${DISKBASE}-pt.sf" 2>&1 | tee /tmp/restore.log
 else
-    echo " No d1.partitions found"
+    echo " WARNING: No partition table file found."
+fi
+
+partprobe "\$DISK" 2>&1 | tee -a /tmp/restore.log || true
+
+# -----------------------------------
+# RESTORE BOOT SECTOR (MBR BOOT CODE)
+# -----------------------------------
+if [[ -f "\${DISKBASE}-mbr" ]]; then
+    echo " Restoring MBR boot code from \${DISKBASE}-mbr..."
+    dd if="\${DISKBASE}-mbr" of="\$DISK" bs=446 count=1 conv=notrunc 2>&1 | tee -a /tmp/restore.log
+else
+    echo " No MBR boot sector file found."
 fi
 
 echo
 echo " Scanning for *-ptcl-img.*"
-ls -l | grep ptcl || echo "NONE FOUND"
+ls -l | grep ptcl || echo " NONE FOUND"
 echo
 
 found_any=0
 
-# Handles files like:
-#   nvme0n1p1.vfat-ptcl-img.zst.aa
-#   nvme0n1p2.ext4-ptcl-img.zst.ab
 for stub in \$(ls *-ptcl-img.* 2>/dev/null | sed -E 's/\\.[A-Za-z0-9]{2}\$//' | sort -u); do
     found_any=1
 
@@ -89,8 +113,6 @@ for stub in \$(ls *-ptcl-img.* 2>/dev/null | sed -E 's/\\.[A-Za-z0-9]{2}\$//' | 
     echo "------------------------------------------------------"
     echo " Restoring stub: \$stub"
     echo " Target partition: \$target"
-    echo " Segments: \${segs[*]}"
-    echo
 
     if [[ "\$stub" == *.gz ]]; then
         cat "\${segs[@]}" | gunzip -c | partclone.restore -C -s - -o "\$target"
@@ -109,13 +131,12 @@ echo " RESTORE COMPLETE"
 echo "============================"
 
 if [[ \$found_any -eq 0 ]]; then
-    echo " WARNING: No partition images restored!"
+    echo " WARNING: No partitions restored!"
 fi
 
 shutdown now
 EOF
 
-# Make restore executable and also expose it as /autorun/autorun for safety
 chmod 755 "$ISOEX/autorun/restore"
 cp "$ISOEX/autorun/restore" "$ISOEX/autorun/autorun"
 chmod 755 "$ISOEX/autorun/autorun"
@@ -146,5 +167,12 @@ xorriso -as mkisofs \
         -no-emul-boot \
     "$ISOEX"
 
-echo "[*] ISO built: $OUTISO"
+cleanup() {
+  if [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]]; then
+    echo "[*] Cleaning up temp dir: $WORKDIR"
+    rm -rf "$WORKDIR"
+  fi
+}
+trap cleanup EXIT
 
+echo "[*] ISO built: $OUTISO"
