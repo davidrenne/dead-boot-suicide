@@ -273,6 +273,12 @@ you’ve become part of natural selection in software form. 🧬🔥
 
 ---
 
+## Other types of suicides
+
+There is an alternate script located [here](https://github.com/davidrenne/dead-boot-suicide/tree/main/dead-boot-suicide-largest-disk-emmc-sd-nvme#-dead-boot-suicide-largest-disk-emmc-sd-nvme-) which instead of passing the disk to suicide write, it will auto pick the largest target.  Think of a use case that you have a downloadable image or selling a USB stick with this intending to flash any computer.  There are special steps that you must take with an EMMC hard drive because of the differences in disk types to get this working, but when you do you might be happy with having a USB stick that is compatible with all modern hard drive types. 
+
+---
+
 # **📜 License**
 
 MIT, because nothing matters. 🪦
