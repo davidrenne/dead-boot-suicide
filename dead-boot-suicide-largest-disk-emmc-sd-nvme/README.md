@@ -76,7 +76,7 @@ zstd -dc disk.img.zst | dd of=/dev/mmcblk0 bs=16M status=progress
 
 ### 📁 Where `disk.img.zst` actually lives (so one ISO can cover NVMe/SATA _and_ eMMC)
 
-Point **`dead-boot-disk-emmc-sd-nvme`** (same tool as **`vgwgenisoAnyDisk`** in this repo—rename or symlink if you like) at your Clonezilla **`savedisk` folder** (the image repo folder Clonezilla created, e.g. `HW-…-img`). That tree is what gets baked into the ISO.
+Point **`dead-boot-suicide-largest-disk-emmc-sd-nvme`** at your Clonezilla **`savedisk` folder** (the image repo folder Clonezilla created, e.g. `HW-…-img`). That tree is what gets baked into the ISO.
 
 - **NVMe / SATA:** keep the normal Clonezilla layout at the **top level** of that folder (partition stubs, partition table files, etc.)—the script restores from there.
 - **eMMC:** the autorun switches to a subfolder named **`mmc`**. Put your **full-disk** zstd image here:
