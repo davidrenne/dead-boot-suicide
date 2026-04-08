@@ -1,0 +1,695 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 3 ]]; then
+  echo "Usage: $0 systemrescue.iso image_folder output.iso"
+  exit 1
+fi
+
+SYSR="$1"
+IMGDIR="$2"
+OUTISO="${3/#\~/$HOME}"
+
+if [[ ! -f "$SYSR" ]]; then echo "ERROR: ISO not found: $SYSR"; exit 1; fi
+if [[ ! -d "$IMGDIR" ]]; then echo "ERROR: Image folder not found: $IMGDIR"; exit 1; fi
+
+mkdir -p "$(dirname "$OUTISO")"
+
+command -v xorriso >/dev/null || { echo "Install xorriso"; exit 1; }
+command -v 7z >/dev/null || { echo "Install p7zip (7z)"; exit 1; }
+
+WORKDIR="$(mktemp -d)"
+ISOEX="$WORKDIR/iso"
+IMGBASE="$(basename "$IMGDIR")"
+
+mkdir -p "$ISOEX"
+
+echo "[*] Extracting ISO..."
+7z x "$SYSR" -o"$ISOEX" > /dev/null
+
+# -----------------------------------
+# CREATE AUTORUN RESTORE SCRIPT
+# -----------------------------------
+mkdir -p "$ISOEX/autorun"
+
+cat > "$ISOEX/autorun/restore" << EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOGFILE="/tmp/restore.log"
+exec > >(tee -a "\$LOGFILE") 2>&1
+
+fail() {
+    echo
+    echo "FATAL: \$*"
+    echo "See log: \$LOGFILE"
+    bash
+    exit 1
+}
+
+require_cmd() {
+    command -v "\$1" >/dev/null 2>&1 || fail "Missing required command: \$1"
+}
+
+get_total_stub_bytes() {
+    local stub="\$1"
+    local total
+    total=\$(du -cb "\${stub}".* 2>/dev/null | tail -n1 | awk '{print \$1}')
+    echo "\${total:-0}"
+}
+
+get_parttable_file() {
+    if [[ "\$DISKBASE" == mmcblk* ]]; then
+        if [[ -f "mmcblk0-pt.sf" ]]; then
+            echo "mmcblk0-pt.sf"
+        elif [[ -f "\${DISKBASE}-pt.sf" ]]; then
+            echo "\${DISKBASE}-pt.sf"
+        else
+            echo ""
+        fi
+        return
+    fi
+
+    if [[ "\$DISKBASE" == nvme* ]]; then
+        if [[ -f "\${DISKBASE}-pt.sf" ]]; then
+            echo "\${DISKBASE}-pt.sf"
+        elif [[ -f "nvme0n1-pt.sf" ]]; then
+            echo "nvme0n1-pt.sf"
+        elif [[ -f "d1.partitions" ]]; then
+            echo "d1.partitions"
+        else
+            echo ""
+        fi
+        return
+    fi
+
+    if [[ -f "\${DISKBASE}-pt.sf" ]]; then
+        echo "\${DISKBASE}-pt.sf"
+    elif [[ -f "d1.partitions" ]]; then
+        echo "d1.partitions"
+    else
+        echo ""
+    fi
+}
+
+get_mbr_file() {
+    if [[ "\$DISKBASE" == mmcblk* ]]; then
+        if [[ -f "mmcblk0-mbr" ]]; then
+            echo "mmcblk0-mbr"
+        elif [[ -f "\${DISKBASE}-mbr" ]]; then
+            echo "\${DISKBASE}-mbr"
+        else
+            echo ""
+        fi
+        return
+    fi
+
+    if [[ "\$DISKBASE" == nvme* ]]; then
+        if [[ -f "\${DISKBASE}-mbr" ]]; then
+            echo "\${DISKBASE}-mbr"
+        elif [[ -f "nvme0n1-mbr" ]]; then
+            echo "nvme0n1-mbr"
+        else
+            echo ""
+        fi
+        return
+    fi
+
+    if [[ -f "\${DISKBASE}-mbr" ]]; then
+        echo "\${DISKBASE}-mbr"
+    else
+        echo ""
+    fi
+}
+
+get_source_last_lba() {
+    local ptfile="\$1"
+    awk '
+    {
+        start=""
+        size=""
+        for (i=1; i<=NF; i++) {
+            if (\$i == "start=" && (i+1) <= NF) {
+                start=\$(i+1)
+                gsub(/,/, "", start)
+            } else if (\$i ~ /^start=/) {
+                start=\$i
+                sub(/^start=/, "", start)
+                gsub(/,/, "", start)
+            }
+
+            if (\$i == "size=" && (i+1) <= NF) {
+                size=\$(i+1)
+                gsub(/,/, "", size)
+            } else if (\$i ~ /^size=/) {
+                size=\$i
+                sub(/^size=/, "", size)
+                gsub(/,/, "", size)
+            }
+        }
+
+        if (start != "" && size != "") {
+            end = start + size - 1
+            if (end > max) max = end
+        }
+    }
+    END {
+        print max + 0
+    }' "\$ptfile"
+}
+
+restore_stub() {
+    local stub="\$1"
+    local target="\$2"
+    local segs=( "\${stub}".* )
+    local mode=""
+
+    if [[ "\$stub" == *".dd-ptcl-img"* ]] || [[ "\$stub" == *-dd-img* ]]; then
+        mode="dd"
+    elif [[ "\$stub" == *-ptcl-img* ]]; then
+        mode="partclone"
+    else
+        fail "Unknown image type for stub: \$stub"
+    fi
+
+    echo "------------------------------------------------------"
+    echo "Restoring stub: \$stub"
+    echo "Stub size     : \${STUB_SIZES[\$stub]} bytes compressed"
+    echo "Target        : \$target"
+    echo "Restore mode  : \$mode"
+    lsblk -b -o NAME,SIZE,FSTYPE,PARTLABEL,TYPE "\$target" || true
+
+    if [[ "\$mode" == "partclone" ]]; then
+        if [[ "\$stub" == *.gz ]]; then
+            cat "\${segs[@]}" | gunzip -c | partclone.restore -C -s - -o "\$target"
+        elif [[ "\$stub" == *.xz ]]; then
+            cat "\${segs[@]}" | xzcat | partclone.restore -C -s - -o "\$target"
+        elif [[ "\$stub" == *.zst ]] || [[ "\$stub" == *.zstd ]]; then
+            cat "\${segs[@]}" | zstd -dc | partclone.restore -C -s - -o "\$target"
+        else
+            cat "\${segs[@]}" | partclone.restore -C -s - -o "\$target"
+        fi
+    else
+        if [[ "\$stub" == *.gz ]]; then
+            cat "\${segs[@]}" | gunzip -c | dd of="\$target" bs=4M iflag=fullblock conv=fsync status=progress
+        elif [[ "\$stub" == *.xz ]]; then
+            cat "\${segs[@]}" | xzcat | dd of="\$target" bs=4M iflag=fullblock conv=fsync status=progress
+        elif [[ "\$stub" == *.zst ]] || [[ "\$stub" == *.zstd ]]; then
+            cat "\${segs[@]}" | zstd -dc | dd of="\$target" bs=4M iflag=fullblock conv=fsync status=progress
+        else
+            cat "\${segs[@]}" | dd of="\$target" bs=4M iflag=fullblock conv=fsync status=progress
+        fi
+    fi
+}
+
+expand_partitions() {
+    echo
+    echo "Expanding largest partition to fill remaining disk space..."
+
+    # After imaging a smaller disk onto a larger one, the backup GPT lives in the wrong place.
+    # Without relocating it, free space at the end of the disk is invisible to parted/growpart.
+    echo "Relocating GPT backup to end of disk (if GPT)..."
+    sgdisk -e "\$DISK" 2>/dev/null || true
+    partprobe "\$DISK" || true
+    udevadm settle || true
+    sleep 1
+
+    LARGEST_PART="\$(lsblk -ln -b -o NAME,SIZE,TYPE "\$DISK" | awk '\$3=="part"{print \$1, \$2}' | sort -k2,2n | tail -n1 | awk '{print \$1}')"
+
+    if [[ -z "\$LARGEST_PART" ]]; then
+        echo "WARNING: Could not determine largest partition to expand."
+    else
+        LARGEST_PART_DEV="/dev/\$LARGEST_PART"
+        echo "Largest partition detected: \$LARGEST_PART_DEV"
+
+        PARTNUM="\$(lsblk -dn -o PARTN "\$LARGEST_PART_DEV" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+        if [[ -z "\$PARTNUM" || "\$PARTNUM" == "0" ]]; then
+            PARTNUM="\$(echo "\$LARGEST_PART" | sed -E 's/^.*[^0-9]([0-9]+)$/\\1/')"
+        fi
+        if [[ -z "\$PARTNUM" ]]; then
+            echo "WARNING: Could not extract partition number from \$LARGEST_PART"
+        else
+            LAST_NUM="\$(lsblk -ln -o PARTN,TYPE "\$DISK" | awk '\$2=="part"{print \$1}' | sort -n | tail -n1 | tr -d '[:space:]')"
+            if [[ -n "\$LAST_NUM" && "\$PARTNUM" != "\$LAST_NUM" ]]; then
+                echo "WARNING: Largest partition is #\$PARTNUM but the last partition on disk is #\$LAST_NUM."
+                echo "WARNING: parted cannot grow partition \$PARTNUM into free space at the end while partition \$LAST_NUM still sits after it (e.g. swap or recovery)."
+                echo "WARNING: Fix the source image layout (put data/root last) or resize manually."
+            fi
+
+            echo "Partition layout before resize:"
+            parted -s "\$DISK" print free 2>/dev/null || parted -s "\$DISK" print || true
+
+            echo "Resizing partition \$PARTNUM on \$DISK to 100%..."
+            if ! parted -s "\$DISK" resizepart "\$PARTNUM" 100%; then
+                echo "WARNING: parted resizepart failed."
+                if command -v growpart >/dev/null 2>&1; then
+                    echo "Trying growpart \$DISK \$PARTNUM..."
+                    growpart "\$DISK" "\$PARTNUM" || echo "WARNING: growpart also failed"
+                fi
+            fi
+
+            partprobe "\$DISK" || true
+            udevadm settle || true
+            sleep 2
+
+            FSTYPE="\$(lsblk -ln -o FSTYPE "\$LARGEST_PART_DEV" | head -n1 | xargs)"
+            echo "Filesystem on \$LARGEST_PART_DEV: \${FSTYPE:-unknown}"
+
+            case "\$FSTYPE" in
+                LVM2_member|lvm*|LVM*)
+                    echo "LVM physical volume on \$LARGEST_PART_DEV — partition was resized; growing PV and logical vole(s)..."
+                    if ! command -v pvresize >/dev/null 2>&1 || ! command -v lvextend >/dev/null 2>&1; then
+                        echo "WARNING: LVM tools missing (pvresize/lvextend). Install lvm2 or extend PV/LV manually."
+                    else
+                        pvresize "\$LARGEST_PART_DEV" || echo "WARNING: pvresize failed"
+                        VG="\$(pvs --noheadings -o vg_name "\$LARGEST_PART_DEV" 2>/dev/null | head -n1 | tr -d '[:space:]')"
+                        if [[ -z "\$VG" ]]; then
+                            echo "WARNING: Could not read volume group for \$LARGEST_PART_DEV"
+                        else
+                            vgchange -ay "\$VG" 2>/dev/null || true
+                            udevadm settle || true
+                            LV_PATH="\$(lvs "\$VG" --noheadings -o lv_path,lv_size --units b --nosuffix 2>/dev/null | sort -k2,2n | tail -n1 | awk '{print \$1}')"
+                            if [[ -z "\$LV_PATH" ]]; then
+                                echo "WARNING: No logical volumes listed for VG \$VG"
+                            else
+                                echo "Extending largest LV in \$VG: \$LV_PATH"
+                                lvextend -r -l +100%FREE "\$LV_PATH" || echo "WARNING: lvextend -r failed"
+                            fi
+                        fi
+                    fi
+                    ;;
+                ext2|ext3|ext4)
+                    echo "Running filesystem check on \$LARGEST_PART_DEV..."
+                    e2fsck -fy "\$LARGEST_PART_DEV" || true
+                    echo "Growing ext filesystem on \$LARGEST_PART_DEV..."
+                    resize2fs "\$LARGEST_PART_DEV" || echo "WARNING: resize2fs failed"
+                    ;;
+                xfs)
+                    TMPMNT="/mnt/expand-root"
+                    mkdir -p "\$TMPMNT"
+                    mount "\$LARGEST_PART_DEV" "\$TMPMNT" || fail "Could not mount \$LARGEST_PART_DEV for xfs_growfs"
+                    echo "Growing XFS filesystem on \$LARGEST_PART_DEV..."
+                    xfs_growfs "\$TMPMNT" || echo "WARNING: xfs_growfs failed"
+                    umount "\$TMPMNT" || true
+                    ;;
+                btrfs)
+                    TMPMNT="/mnt/expand-root"
+                    mkdir -p "\$TMPMNT"
+                    mount "\$LARGEST_PART_DEV" "\$TMPMNT" || fail "Could not mount \$LARGEST_PART_DEV for btrfs resize"
+                    echo "Growing Btrfs filesystem on \$LARGEST_PART_DEV..."
+                    btrfs filesystem resize max "\$TMPMNT" || echo "WARNING: btrfs resize failed"
+                    umount "\$TMPMNT" || true
+                    ;;
+                "")
+                    echo "WARNING: No filesystem detected on \$LARGEST_PART_DEV, skipping filesystem grow"
+                    ;;
+                *)
+                    echo "WARNING: Unsupported filesystem type '\$FSTYPE' on \$LARGEST_PART_DEV, skipping filesystem grow"
+                    ;;
+            esac
+        fi
+    fi
+}
+
+prompt_remove_usb_before_shutdown() {
+    echo
+    for i in \$(seq 15 -1 1); do
+        echo "The install script is about to shutdown in \$i seconds please remove your USB stick after it shuts down and do not eject prematurely."
+        sleep 1
+    done
+}
+
+echo "============================"
+echo " DEAD-BOOT-SUICIDE-LARGEST-DISK-EMMC-SD-NVME "
+echo "============================"
+echo
+
+require_cmd lsblk
+require_cmd awk
+require_cmd sort
+require_cmd wipefs
+require_cmd dd
+require_cmd sgdisk
+require_cmd sfdisk
+require_cmd partprobe
+require_cmd udevadm
+require_cmd partclone.restore
+require_cmd blockdev
+require_cmd zstd
+require_cmd gunzip
+require_cmd xzcat
+require_cmd mount
+require_cmd umount
+require_cmd swapoff
+require_cmd sed
+require_cmd parted
+require_cmd e2fsck
+require_cmd resize2fs
+require_cmd pwd
+
+IMG="/run/archiso/bootmnt/custom-img/$IMGBASE"
+
+if [[ ! -d "\$IMG" ]]; then
+    fail "Image directory missing: \$IMG"
+fi
+
+echo "Detecting target disk..."
+
+# -----------------------------------
+# 1. PREFER NVME INTERNAL
+# 2. FALL BACK TO LARGEST NON-REMOVABLE NON-USB DISK
+# -----------------------------------
+NVME_DISK=\$(lsblk -dn -b -o NAME,SIZE,TYPE,RM,TRAN | \
+  awk '\$3=="disk" && \$4==0 && \$1 ~ /^nvme/ && (\$5=="" || \$5!="usb") {print \$1, \$2}' | \
+  sort -k2,2n | tail -n1 | awk '{print \$1}')
+
+if [[ -n "\$NVME_DISK" ]]; then
+    DISK="/dev/\$NVME_DISK"
+    echo "Using NVMe disk: \$DISK"
+else
+    FALLBACK_DISK=\$(lsblk -dn -b -o NAME,SIZE,TYPE,RM,TRAN | \
+      awk '\$3=="disk" && \$4==0 && (\$5=="" || \$5!="usb") {print \$1, \$2}' | \
+      sort -k2,2n | tail -n1 | awk '{print \$1}')
+
+    [[ -n "\$FALLBACK_DISK" ]] || fail "No valid internal target disk found"
+
+    DISK="/dev/\$FALLBACK_DISK"
+    echo "Using fallback disk: \$DISK"
+fi
+
+[[ -b "\$DISK" ]] || fail "Target disk is not a block device: \$DISK"
+
+DISKBASE="\$(basename "\$DISK")"
+IS_EMMC=0
+if [[ "\$DISKBASE" == mmcblk* ]]; then
+    IS_EMMC=1
+fi
+
+# -----------------------------------
+# SWITCH IMAGE SOURCE FOR EMMC
+# -----------------------------------
+RESTORE_IMG_DIR="\$IMG"
+if [[ "\$IS_EMMC" -eq 1 ]]; then
+    RESTORE_IMG_DIR="\$IMG/mmc"
+    [[ -d "\$RESTORE_IMG_DIR" ]] || fail "Target is eMMC (\$DISKBASE) but mmc restore folder is missing: \$RESTORE_IMG_DIR"
+    echo "eMMC target detected. Using restore assets from: \$RESTORE_IMG_DIR"
+else
+    echo "Using restore assets from: \$RESTORE_IMG_DIR"
+fi
+
+echo
+echo "#############################################"
+echo "TARGET DISK: \$DISK"
+lsblk -o NAME,SIZE,MODEL,TRAN,TYPE "\$DISK" || true
+echo "RESTORE DIR : \$RESTORE_IMG_DIR"
+echo "#############################################"
+echo
+
+DISK_SIZE=\$(lsblk -dn -o SIZE "\$DISK" 2>/dev/null || echo "?")
+echo "Starting destructive write in 30 seconds. Power off now if this is wrong."
+for i in \$(seq 30 -1 1); do
+    echo "TARGET DISK: \$DISK (\$DISK_SIZE)"
+    echo ">>> \$i..."
+    sleep 1
+done
+
+echo
+echo "Proceeding with restore..."
+echo
+
+echo "Using restore directory: \$RESTORE_IMG_DIR"
+cd "\$RESTORE_IMG_DIR" || fail "Could not cd into restore directory: \$RESTORE_IMG_DIR"
+pwd
+ls -1
+
+echo
+echo "Target disk geometry:"
+lsblk -b -o NAME,SIZE,TYPE "\$DISK"
+
+TARGET_SECTORS=\$(blockdev --getsz "\$DISK")
+TARGET_BYTES=\$(blockdev --getsize64 "\$DISK")
+
+echo "Target disk sectors: \$TARGET_SECTORS"
+echo "Target disk bytes  : \$TARGET_BYTES"
+echo
+
+# -----------------------------------
+# DEACTIVATE ANYTHING USING THE TARGET DISK
+# -----------------------------------
+echo "Deactivating mounts, swap, and LVM on \$DISK..."
+
+echo "Mounted filesystems touching target:"
+mount | grep "\$DISKBASE" || true
+
+echo "Active swap:"
+swapon --show || true
+
+echo "Active LVM:"
+pvs 2>/dev/null || true
+vgs 2>/dev/null || true
+lvs 2>/dev/null || true
+
+while read -r mp; do
+    [[ -n "\$mp" ]] && umount -lf "\$mp" || true
+done < <(lsblk -ln -o MOUNTPOINT "\$DISK" | awk 'NF')
+
+while read -r dev; do
+    [[ -n "\$dev" ]] && swapoff "\$dev" || true
+done < <(lsblk -ln -o PATH,TYPE "\$DISK" | awk '\$2=="part"{print \$1}')
+
+if command -v lvchange >/dev/null 2>&1; then
+    lvchange -an \$(lvs --noheadings -o lv_path 2>/dev/null) 2>/dev/null || true
+fi
+
+if command -v vgchange >/dev/null 2>&1; then
+    vgchange -an 2>/dev/null || true
+fi
+
+if command -v dmsetup >/dev/null 2>&1; then
+    dmsetup remove_all 2>/dev/null || true
+fi
+
+partprobe "\$DISK" || true
+udevadm settle || true
+sleep 2
+
+# -----------------------------------
+# WIPE TARGET DISK FIRST
+# -----------------------------------
+echo "Wiping existing disk metadata on \$DISK..."
+wipefs -a "\$DISK" || true
+sgdisk --zap-all "\$DISK" || true
+dd if=/dev/zero of="\$DISK" bs=1M count=10 conv=fsync status=none
+
+partprobe "\$DISK" || true
+udevadm settle || true
+sleep 2
+
+# -----------------------------------
+# EMMC MODE: WHOLE-DISK RAW RESTORE
+# -----------------------------------
+if [[ "\$IS_EMMC" -eq 1 ]]; then
+    RAWDISK_IMG="\$RESTORE_IMG_DIR/disk.img.zst"
+    [[ -f "\$RAWDISK_IMG" ]] || fail "eMMC mode requires disk.img.zst in \$RESTORE_IMG_DIR"
+
+    echo "Whole-disk eMMC restore mode"
+    echo "Source image : \$RAWDISK_IMG"
+    echo "Target disk  : \$DISK"
+
+    zstd -dc "\$RAWDISK_IMG" | dd of="\$DISK" bs=16M iflag=fullblock conv=fsync status=progress
+
+    sync
+    partprobe "\$DISK" || true
+    udevadm settle || true
+    sleep 3
+
+    echo
+    echo "Post-restore disk layout:"
+    lsblk -f "\$DISK" || true
+
+    echo
+    echo "EMMC whole-disk restore complete."
+    echo "Skipping partition/image-stub restore logic."
+    expand_partitions
+    prompt_remove_usb_before_shutdown
+    shutdown now
+fi
+
+# -----------------------------------
+# NON-EMMC MODE: FIND IMAGE STUBS FIRST
+# -----------------------------------
+mapfile -t IMAGE_STUBS < <(
+    ls -1 *.dd-ptcl-img.* *-ptcl-img.* *-dd-img.* 2>/dev/null | \
+    sed -E 's/\\.[A-Za-z0-9]{2}\$//' | \
+    sort -u
+)
+
+[[ \${#IMAGE_STUBS[@]} -gt 0 ]] || fail "No image stubs found in \$RESTORE_IMG_DIR"
+
+declare -A STUB_SIZES
+for stub in "\${IMAGE_STUBS[@]}"; do
+    STUB_SIZES["\$stub"]="\$(get_total_stub_bytes "\$stub")"
+done
+
+# Sort ascending: smallest stub should hit smallest target partition
+mapfile -t SORTED_STUBS < <(
+    for s in "\${!STUB_SIZES[@]}"; do
+        echo "\${STUB_SIZES[\$s]}:\$s"
+    done | sort -t: -k1,1n | cut -d: -f2-
+)
+
+echo "Image stubs (smallest -> largest):"
+for s in "\${SORTED_STUBS[@]}"; do
+    echo "  \$s (\${STUB_SIZES[\$s]} bytes compressed)"
+done
+
+# -----------------------------------
+# PARTITIONING STRATEGY
+# 1. Use source partition table only if it fits target disk
+# 2. Otherwise dynamically create a sane GPT layout for common cases
+# -----------------------------------
+PTFILE="\$(get_parttable_file)"
+[[ -n "\$PTFILE" ]] && PTFILE="\$RESTORE_IMG_DIR/\$PTFILE"
+
+if [[ -n "\$PTFILE" ]]; then
+    SOURCE_LAST_LBA=\$(get_source_last_lba "\$PTFILE")
+    echo "Found source partition table: \$PTFILE"
+    echo "Source last LBA: \$SOURCE_LAST_LBA"
+    echo "Target last LBA: \$((TARGET_SECTORS - 1))"
+else
+    SOURCE_LAST_LBA=0
+    echo "No source partition table file found."
+fi
+
+USE_SOURCE_PT=0
+if [[ -n "\$PTFILE" && "\$SOURCE_LAST_LBA" -gt 0 && "\$SOURCE_LAST_LBA" -lt "\$TARGET_SECTORS" ]]; then
+    USE_SOURCE_PT=1
+fi
+
+if [[ "\$USE_SOURCE_PT" -eq 1 ]]; then
+    echo "Source partition table fits target disk. Restoring it..."
+    if ! sfdisk "\$DISK" < "\$PTFILE"; then
+        fail "sfdisk failed while restoring \$PTFILE"
+    fi
+else
+    echo "Source partition table missing or too large. Building dynamic GPT layout..."
+
+    STUB_COUNT=\${#SORTED_STUBS[@]}
+
+    if [[ "\$STUB_COUNT" -eq 1 ]]; then
+        echo "Creating single Linux partition layout..."
+        sgdisk -og "\$DISK"
+        sgdisk -n 1:1MiB:0 -t 1:8300 -c 1:"linux-root" "\$DISK"
+    elif [[ "\$STUB_COUNT" -eq 2 ]]; then
+        echo "Creating EFI + Linux layout..."
+        sgdisk -og "\$DISK"
+        sgdisk -n 1:1MiB:+512MiB -t 1:EF00 -c 1:"efi-system" "\$DISK"
+        sgdisk -n 2:0:0        -t 2:8300 -c 2:"linux-root" "\$DISK"
+    else
+        fail "Dynamic fallback currently supports 1 or 2 image stubs. Found \$STUB_COUNT. Source partition table did not fit target disk."
+    fi
+fi
+
+partprobe "\$DISK" || true
+udevadm settle || true
+sleep 2
+
+# -----------------------------------
+# RESTORE BOOT SECTOR (OPTIONAL)
+# -----------------------------------
+MBRFILE="\$(get_mbr_file)"
+[[ -n "\$MBRFILE" ]] && MBRFILE="\$RESTORE_IMG_DIR/\$MBRFILE"
+
+if [[ -n "\$MBRFILE" ]]; then
+    echo "Restoring MBR from \$MBRFILE..."
+    dd if="\$MBRFILE" of="\$DISK" bs=446 count=1 conv=notrunc status=none
+else
+    echo "No MBR boot sector file found."
+fi
+
+# -----------------------------------
+# BUILD TARGET PARTITION LIST (SORTED BY SIZE ASC)
+# -----------------------------------
+echo
+echo "Detecting target partitions after partitioning..."
+
+mapfile -t TARGET_PARTS < <(
+    lsblk -ln -b -o NAME,SIZE,TYPE "\$DISK" | \
+    awk '\$3=="part" {print \$1, \$2}' | \
+    sort -k2,2n | \
+    awk '{print \$1}'
+)
+
+[[ \${#TARGET_PARTS[@]} -gt 0 ]] || fail "No partitions found on target disk after partitioning"
+
+echo "Target partitions (smallest -> largest):"
+for p in "\${TARGET_PARTS[@]}"; do
+    lsblk -ln -b -o NAME,SIZE,FSTYPE,PARTLABEL,TYPE "/dev/\$p" 2>/dev/null || echo "/dev/\$p"
+done
+
+if [[ "\${#TARGET_PARTS[@]}" -lt "\${#SORTED_STUBS[@]}" ]]; then
+    fail "Not enough target partitions for image stubs"
+fi
+
+echo
+echo "Mapping image stubs to target partitions by size order..."
+
+# -----------------------------------
+# RESTORE IMAGE STUBS
+# -----------------------------------
+found_any=0
+
+for ((i=0; i<\${#SORTED_STUBS[@]}; i++)); do
+    stub="\${SORTED_STUBS[\$i]}"
+    target="/dev/\${TARGET_PARTS[\$i]}"
+
+    found_any=1
+    restore_stub "\$stub" "\$target"
+done
+
+echo
+echo "RESTORE COMPLETE"
+
+if [[ "\$found_any" -eq 0 ]]; then
+    fail "No partitions were restored"
+fi
+
+expand_partitions
+
+prompt_remove_usb_before_shutdown
+shutdown now
+EOF
+
+chmod 755 "$ISOEX/autorun/restore"
+cp "$ISOEX/autorun/restore" "$ISOEX/autorun/autorun"
+chmod 755 "$ISOEX/autorun/autorun"
+
+# -----------------------------------
+# INJECT IMAGE DIRECTORY
+# -----------------------------------
+mkdir -p "$ISOEX/custom-img"
+cp -a "$IMGDIR" "$ISOEX/custom-img/"
+
+VOLID="RESCUE1202"
+
+# -----------------------------------
+# REPACK ISO
+# -----------------------------------
+# -----------------------------------
+# REPACK ISO
+# -----------------------------------
+xorriso -as mkisofs -iso-level 3 -l -r -J -joliet-long -V "$VOLID" -o "$OUTISO" -isohybrid-mbr "$ISOEX/isolinux/isohdpfx.bin" -c isolinux/boot.cat -b isolinux/isolinux.bin -no-emul-boot -boot-load-size 4 -boot-info-table -eltorito-alt-boot -e EFI/archiso/efiboot.img -no-emul-boot "$ISOEX"
+
+cleanup() {
+  if [[ -n "${WORKDIR:-}" && -d "$WORKDIR" ]]; then
+    rm -rf "$WORKDIR"
+  fi
+}
+trap cleanup EXIT
+
+if [[ -f "$OUTISO" ]]; then
+  echo "[*] ISO built: $(realpath "$OUTISO" 2>/dev/null || echo "$OUTISO")"
+else
+  echo "ERROR: ISO build reported success but output file is missing: $OUTISO"
+  exit 1
+fi
