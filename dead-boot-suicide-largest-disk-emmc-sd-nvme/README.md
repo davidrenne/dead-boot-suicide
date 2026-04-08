@@ -104,7 +104,7 @@ For the **main** image used by this ISO (NVMe/SATA restore), run Clonezilla agai
 On your pristine eMMC machine:
 
 ```bash
-dd if=/dev/mmcblk0 bs=16M status=progress | zstd -T0 -o disk.img.zst
+sudo dd if=/dev/mmcblk0 bs=16M status=progress | zstd -T0 -o disk.img.zst
 ```
 
 That’s it.
