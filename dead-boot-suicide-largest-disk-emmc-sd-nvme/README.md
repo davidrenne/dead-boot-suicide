@@ -91,11 +91,29 @@ If the target disk is eMMC and `mmc/disk.img.zst` is missing, restore fails earl
 
 So: **you prepare the folder** (Clonezilla export + optional `mmc/disk.img.zst`). The ISO carries both stories; at boot the script picks the path that matches the hardware.
 
-### 📸 Export the image with Clonezilla first
+### 📸 Export the image with Clonezilla first on a non eMMC disk
 
 Before **Build the ISO** (below), capture the main computer disk hardware with **Clonezilla** ande resulting **`savedisk`** image folder to the machine where you run this generator. Follow the **[Export Image using Clonezilla](https://github.com/davidrenne/dead-boot-suicide/blob/main/README.md#2-export-image-using-clonezilla-)** walkthrough in the main repo.
 
 For the **main** image used by this ISO (NVMe/SATA restore), run Clonezilla against the **internal system disk** on the source unit—typically **NVMe** (e.g. `nvme0n1`) or **SATA** (e.g. `sda` / `sda1` is a partition on that disk; you still select the **whole disk** in `savedisk` as Clonezilla documents). That export is what you pass as the second argument to the script. The optional **`mmc/disk.img.zst`** path above is separate and is what you add for **eMMC** targets.
+
+---
+
+##📸 Creating the eMMC Raw Image 
+
+On your pristine eMMC machine:
+
+```bash
+dd if=/dev/mmcblk0 bs=16M status=progress | zstd -T0 -o disk.img.zst
+```
+
+That’s it.
+
+No Clonezilla.
+No partition guessing.
+No LVM reconstruction.
+
+You now have a perfect clone of reality.  Place this in the mmc directory in your clonezilla export folder.
 
 ---
 
