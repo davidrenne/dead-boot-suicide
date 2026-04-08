@@ -4,7 +4,7 @@ A bootable ISO generator that doesn’t ask questions—it just finds the larges
 
 No prompts. No disk arguments. No second chances.
 
-If it boots, it wipes. ☠️🔥
+If it boots, it wipes your pristine image you captured. ☠️🔥
 
 ---
 
