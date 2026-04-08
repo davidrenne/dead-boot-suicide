@@ -215,6 +215,22 @@ nvme0n1
 
 ---
 
+## 💾 Writing the ISO to a bootable USB
+
+After you produces an `.iso` with this bash script, you need to copy it to a USB stick in **raw** form so the machine can boot SystemRescue and run the autorun restore—not just copy the file onto a FAT32 volume like a normal document.
+
+Common **open-source** options:
+
+| Tool | Notes |
+|------|--------|
+| **[balenaEtcher](https://etcher.balena.io/)** | Cross‑platform (Windows, macOS, Linux). Pick your ISO, pick the USB drive, flash. Hard to misuse. |
+| **[Rufus](https://rufus.ie/)** | Very popular on **Windows**. GPLv3. Good for ISO → USB, including hybrid images. |
+| **`dd` (terminal)** | Built in on macOS/Linux: low-level copy of the ISO to the **whole device** (e.g. `/dev/rdiskN` on Mac, `/dev/sdX` on Linux). Easy to wipe the wrong disk—triple-check the device name. |
+
+Pick a spare USB drive (contents will be erased), flash the ISO, eject safely, then boot that USB on the target gateway.
+
+---
+
 # **🤖 Autorun Behavior**
 
 On boot:
